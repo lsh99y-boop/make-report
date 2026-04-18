@@ -1,0 +1,516 @@
+# ==========================================
+# DTV 무선국 수검자료 생성기 (Windows 실행파일용)
+# ==========================================
+# TXA/TXB: 원본 엑셀 그대로 복사 + 첫 페이지에 수검 표/이미지 추가
+# 대조검사: 엑셀 양식에서 데이터 읽기
+# exe 빌드: pyinstaller --onefile --windowed --name DTV_수검자료_생성기 DTV_수검자료_생성기_Windows.py
+
+import os, re, traceback, threading, sys
+from copy import copy, deepcopy
+from tkinter import (Tk, Frame, Label, Entry, Button, Text, Scrollbar,
+                     filedialog, messagebox, StringVar, END, WORD, RIGHT, LEFT,
+                     TOP, BOTTOM, BOTH, X, Y, W, E, N, S)
+from tkinter import ttk
+from openpyxl import load_workbook, Workbook
+from openpyxl.drawing.image import Image as OpenpyxlImage
+from openpyxl.styles import Border, Side, Alignment, Font as XlFont, PatternFill
+from openpyxl.worksheet.page import PageMargins
+
+# ==========================================
+# [1] 공통
+# ==========================================
+def set_a4_print_setup(ws):
+    ws.page_setup.orientation=ws.ORIENTATION_PORTRAIT; ws.page_setup.paperSize=ws.PAPERSIZE_A4
+    ws.page_setup.fitToWidth=1; ws.page_setup.fitToHeight=0
+    ws.sheet_properties.pageSetUpPr.fitToPage=True
+    ws.page_margins=PageMargins(left=0.5,right=0.3,top=0.5,bottom=0.5,header=0.3,footer=0.3)
+    ws.print_options.horizontalCentered=True
+
+def copy_full_sheet(src, dst):
+    # 기본 행 높이/열 너비 복사 (원본과 동일하게)
+    if src.sheet_format.defaultRowHeight:
+        dst.sheet_format.defaultRowHeight = src.sheet_format.defaultRowHeight
+    if src.sheet_format.defaultColWidth:
+        dst.sheet_format.defaultColWidth = src.sheet_format.defaultColWidth
+    for col_letter, dim in src.column_dimensions.items():
+        dst.column_dimensions[col_letter].width=dim.width
+        dst.column_dimensions[col_letter].hidden=dim.hidden
+    for row_num, dim in src.row_dimensions.items():
+        dst.row_dimensions[row_num].height=dim.height
+        dst.row_dimensions[row_num].hidden=dim.hidden
+    for row in src.iter_rows():
+        for cell in row:
+            nc=dst.cell(row=cell.row,column=cell.column,value=cell.value)
+            if cell.has_style:
+                nc.font=copy(cell.font); nc.border=copy(cell.border)
+                nc.fill=copy(cell.fill); nc.alignment=copy(cell.alignment)
+                nc.number_format=cell.number_format
+    for m in src.merged_cells.ranges:
+        try: dst.merge_cells(str(m))
+        except: pass
+    if hasattr(src,'_images'):
+        for img in src._images: dst.add_image(deepcopy(img))
+    dst.page_setup.orientation=src.page_setup.orientation
+    dst.page_setup.paperSize=src.page_setup.paperSize
+    if src.page_setup.fitToWidth: dst.page_setup.fitToWidth=src.page_setup.fitToWidth
+    if src.page_setup.fitToHeight: dst.page_setup.fitToHeight=src.page_setup.fitToHeight
+    if src.sheet_properties.pageSetUpPr and src.sheet_properties.pageSetUpPr.fitToPage:
+        dst.sheet_properties.pageSetUpPr.fitToPage=True
+    if src.print_area: dst.print_area=src.print_area
+    dst.page_margins=PageMargins(
+        left=src.page_margins.left,right=src.page_margins.right,
+        top=src.page_margins.top,bottom=src.page_margins.bottom,
+        header=src.page_margins.header,footer=src.page_margins.footer)
+    for brk in src.row_breaks.brk: dst.row_breaks.append(brk)
+    for brk in src.col_breaks.brk: dst.col_breaks.append(brk)
+
+def insert_blank_rows_pages234(ws):
+    """2,3,4페이지 섹션 제목 위 행의 높이를 키워서 간격 확보 (원본 데이터 훼손 없음)
+    + 섹션 제목 B~H 병합 가운데 정렬"""
+    page_titles = ['Frequency Response & Group Delay',
+                   'Amplitude & Phase Error',
+                   'Out of Channel Spectrum']
+    for r in range(1, ws.max_row + 1):
+        v = ws.cell(row=r, column=2).value
+        if v and isinstance(v, str) and v.strip() in page_titles:
+            # 제목 위 행의 높이를 키움 (빈 행 1개 추가 효과)
+            if r > 1:
+                prev_h = ws.row_dimensions[r-1].height or ws.sheet_format.defaultRowHeight or 16.5
+                ws.row_dimensions[r-1].height = prev_h + 17  # 약 1행 높이 추가
+
+    # 섹션 제목 B~H 병합 + 가운데 정렬
+    section_titles = ['Frequency Response & Group Delay', 'Amplitude & Phase Error',
+        'Out of Channel Spectrum', 'Peak/Average & Channel Spectrum',
+        'Signal/Noise & EVM', 'Phase Noise', 'Harmonic', 'Summary']
+    for r in range(1, ws.max_row + 1):
+        v = ws.cell(row=r, column=2).value
+        if v and isinstance(v, str) and v.strip() in section_titles:
+            # 기존 B~G 병합 해제 후 B~H로 확장
+            for m in list(ws.merged_cells.ranges):
+                if m.min_row == r and m.min_col == 2 and m.max_col >= 6:
+                    ws.unmerge_cells(str(m)); break
+            try: ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=8)
+            except: pass
+            ws.cell(row=r, column=2).alignment = Alignment(horizontal='center', vertical='center')
+
+# ==========================================
+# [2] TXA/TXB 첫 페이지에 수검 표+이미지 삽입
+# ==========================================
+def insert_inspection_page(ws, tx_label, measurements, images, log_func=print):
+    """원본 복사된 시트의 첫 페이지에 수검 표+이미지 삽입
+    tx_label: 'TX-A' 또는 'TX-B'
+    measurements: {'power':'', 'bw':'', 'freq':''}  측정결과 값
+    images: {'bw':'경로', 'freq':'경로'}  이미지 파일 경로
+    """
+    # REPORT 병합 해제 및 삭제
+    for m in list(ws.merged_cells.ranges):
+        if m.min_row<=6 and m.min_col==2 and m.max_col>=6:
+            ws.unmerge_cells(str(m))
+    for r in range(1,7):
+        for c in range(1,9): ws.cell(row=r,column=c,value=None)
+
+    thin=Side(style='thin')
+    border=Border(top=thin,left=thin,right=thin,bottom=thin)
+    hf=XlFont(name='Arial',bold=True,color="FFFFFF",size=11)
+    hfill=PatternFill(start_color="203764",end_color="203764",fill_type="solid")
+    ct=Alignment(horizontal='center',vertical='center',wrap_text=True)
+    bf=XlFont(name='Arial',bold=True,size=10)
+    nf=XlFont(name='Arial',size=10)
+
+    # Row 2~3: TX 제목
+    ws.merge_cells('B2:G3')
+    c=ws.cell(row=2,column=2,value=tx_label)
+    c.font=XlFont(name='Arial',size=28,bold=True); c.alignment=ct
+
+    def make_table(r, title, device, limit, result_val):
+        ws.merge_cells(f'B{r}:G{r}')
+        tc=ws.cell(row=r,column=2,value=title)
+        tc.font=bf; tc.alignment=ct
+        r+=1
+        for i,h in enumerate(["장치","검사기준","측정결과","","적부","비고"]):
+            c=ws.cell(row=r,column=2+i,value=h)
+            c.font=hf; c.fill=hfill; c.alignment=ct; c.border=border
+        ws.merge_cells(f'D{r}:E{r}')
+        r+=1
+        for i,v in enumerate([device, limit, result_val,"","적합",""]):
+            c=ws.cell(row=r,column=2+i,value=v)
+            c.font=nf; c.alignment=ct; c.border=border
+        ws.merge_cells(f'D{r}:E{r}')
+        r+=1
+        return r
+
+    def insert_img(r, img_path, num_rows=12):
+        """이미지를 B열~G열에 꽉 차게, 지정 행 수만큼 삽입 (TwoCellAnchor)"""
+        if img_path and os.path.exists(img_path):
+            try:
+                from openpyxl.utils.units import pixels_to_EMU, cm_to_EMU
+                from openpyxl.drawing.spreadsheet_drawing import AnchorMarker, TwoCellAnchor
+                img=OpenpyxlImage(img_path)
+                # TwoCellAnchor: B열(0-based=1) ~ G열 끝(0-based=7), num_rows행
+                marker_from=AnchorMarker(col=1,colOff=0,row=r-1,rowOff=0)
+                marker_to=AnchorMarker(col=7,colOff=0,row=r-1+num_rows,rowOff=0)
+                img.anchor=TwoCellAnchor(_from=marker_from,to=marker_to)
+                ws.add_image(img)
+                log_func(f"    이미지 삽입: Row {r} (B~G, {num_rows}행)")
+                return True
+            except Exception as e:
+                log_func(f"    ⚠️ 이미지 삽입 실패: {e}")
+        return False
+
+    def draw_section_border(start_row, end_row):
+        """B~G열, start_row~end_row 섹션 전체 외곽+좌우 테두리"""
+        thin_side=Side(style='thin')
+        for row in range(start_row, end_row+1):
+            for col in range(2, 8):  # B=2 ~ G=7
+                cell=ws.cell(row=row,column=col)
+                existing=cell.border
+                # 기존 테두리 유지하면서 외곽만 추가
+                t=existing.top if (existing.top and existing.top.style) else (thin_side if row==start_row else None)
+                b=existing.bottom if (existing.bottom and existing.bottom.style) else (thin_side if row==end_row else None)
+                l=thin_side if col==2 else (existing.left if (existing.left and existing.left.style) else None)
+                r_side=thin_side if col==7 else (existing.right if (existing.right and existing.right.style) else None)
+                cell.border=Border(top=t,bottom=b,left=l,right=r_side)
+
+    r=5
+    # 1. 공중선 전력
+    r=make_table(r,"1. 공중선 전력",tx_label,"상한 5%, 하한 5%",measurements.get('power',''))
+    r+=1
+
+    # 2. 점유주파수대역폭
+    bw_section_start=r
+    r=make_table(r,"2. 점유주파수대역폭",tx_label,"6MHz 이하",measurements.get('bw',''))
+    insert_img(r, images.get('bw',''), num_rows=12)
+    bw_section_end=r+12-1
+    draw_section_border(bw_section_start, bw_section_end)
+    r+=12
+
+    r+=1  # 점유주파수대역폭↔주파수정확도 사이 간격 1행
+
+    # 3. 주파수 허용 편차
+    freq_section_start=r
+    r=make_table(r,"3. 주파수 허용 편차 (주파수 정확도)",tx_label,"±1ppm 이하",measurements.get('freq',''))
+    insert_img(r, images.get('freq',''), num_rows=12)
+    freq_section_end=r+12-1
+    draw_section_border(freq_section_start, freq_section_end)
+    r+=12
+
+    # 주파수정확도 이미지 아래 빈 행 1행 삭제
+    ws.delete_rows(r, 1)
+
+    log_func(f"  수검 표 삽입 완료 (표3개 + 이미지 B~G 12행 + 섹션 테두리)")
+
+# ==========================================
+# [3] 대조검사 엑셀에서 데이터 읽기
+# ==========================================
+def read_comparison_excel(xlsx_path, log_func=print):
+    try:
+        wb=load_workbook(xlsx_path,data_only=True); ws=wb.active
+    except Exception as e:
+        log_func(f"  ⚠️ 엑셀 열기 실패: {e}"); return None
+    def cv(row,col):
+        v=ws.cell(row=row,column=col).value
+        return str(v).strip() if v is not None else ''
+    singles={0:cv(2,4),1:cv(3,4),2:cv(4,4),3:cv(5,4),4:cv(6,4),
+        14:cv(16,4),15:cv(17,4),16:cv(18,4),17:cv(19,4),
+        18:cv(20,4),19:cv(21,4),20:cv(22,4),21:cv(23,4),22:cv(24,4)}
+    pairs={5:(cv(7,4),cv(7,5)),6:(cv(8,4),cv(8,5)),7:(cv(9,4),cv(9,5)),
+        8:(cv(10,4),cv(10,5)),9:(cv(11,4),cv(11,5)),10:(cv(12,4),cv(12,5)),
+        11:(cv(13,4),cv(13,5)),12:(cv(14,4),cv(14,5)),13:(cv(15,4),cv(15,5))}
+    has_data=any(v for v in singles.values()) or any(v1 or v2 for v1,v2 in pairs.values())
+    if not has_data:
+        log_func("  ⚠️ 엑셀에 데이터가 없습니다"); return None
+    filled=sum(1 for v in singles.values() if v)+sum(1 for v1,v2 in pairs.values() if v1 or v2)
+    log_func(f"  ✅ 엑셀 읽기 완료: {filled}개 항목")
+    log_func(f"    시설자: {singles[0]}")
+    log_func(f"    허가번호: {singles[1]}")
+    log_func(f"    무선국명: {singles[2]}")
+    return {'singles':singles,'pairs':pairs}
+
+# ==========================================
+# [4] 대조검사 표 작성
+# ==========================================
+def build_comparison_tab(ws, data=None, report_title=''):
+    set_a4_print_setup(ws)
+    thin=Side(style='thin'); medium=Side(style='medium')
+    border=Border(top=thin,left=thin,right=thin,bottom=thin)
+    hf=XlFont(name='Arial',bold=True,color="FFFFFF",size=11)
+    hfill=PatternFill(start_color="203764",end_color="203764",fill_type="solid")
+    ifill=PatternFill(start_color="D6E4F0",end_color="D6E4F0",fill_type="solid")
+    ifill2=PatternFill(start_color="E2EFDA",end_color="E2EFDA",fill_type="solid")
+    ifill3=PatternFill(start_color="FCE4D6",end_color="FCE4D6",fill_type="solid")
+    ifill4=PatternFill(start_color="E4DFEC",end_color="E4DFEC",fill_type="solid")
+    ifill5=PatternFill(start_color="FFF2CC",end_color="FFF2CC",fill_type="solid")
+    ct=Alignment(horizontal='center',vertical='center',wrap_text=True)
+    la=Alignment(horizontal='left',vertical='center',wrap_text=True,indent=1)
+    bf=XlFont(name='Arial',bold=True,size=10)
+    nf=XlFont(name='Arial',size=10)
+    tf=XlFont(name='Arial',size=22,bold=True,color="203764")
+    for c,w in [('A',4),('B',10),('C',13),('D',24),('E',24),('F',10),('G',10)]:
+        ws.column_dimensions[c].width=w
+    def cs(row,col,val,font=nf,fill=None,align=ct):
+        c=ws.cell(row=row,column=col,value=val); c.font=font; c.alignment=align; c.border=border
+        if fill: c.fill=fill
+    def br(r1,r2,c1,c2):
+        for r in range(r1,r2+1):
+            for c in range(c1,c2+1): ws.cell(row=r,column=c).border=border
+    def fr(r1,r2,c1,c2,fill):
+        for r in range(r1,r2+1):
+            for c in range(c1,c2+1): ws.cell(row=r,column=c).fill=fill
+    def sv(idx):
+        if data and 'singles' in data: return data['singles'].get(idx,'')
+        return ''
+    def pv(idx):
+        if data and 'pairs' in data: return data['pairs'].get(idx,('',''))
+        return '',''
+
+    if report_title and report_title.strip():
+        ws.merge_cells('B5:G7')
+        rt=ws.cell(row=5,column=2,value=report_title.strip())
+        rt.font=XlFont(name='Arial',size=32,bold=True,color="203764"); rt.alignment=ct
+        for r in range(5,8):
+            for c in range(2,8): ws.cell(row=r,column=c).border=border
+        ws.row_dimensions[5].height=25; ws.row_dimensions[6].height=25; ws.row_dimensions[7].height=25
+        ws.merge_cells('B12:G14')
+        dc=ws.cell(row=12,column=2,value="대 조 검 사"); dc.font=tf; dc.alignment=ct
+        for r in range(12,15):
+            for c in range(2,8): ws.cell(row=r,column=c).border=border
+        ws.row_dimensions[12].height=22; ws.row_dimensions[13].height=22; ws.row_dimensions[14].height=22
+        ws.row_dimensions[15].height=6; d=11
+    else:
+        ws.merge_cells('B5:G7')
+        dc=ws.cell(row=5,column=2,value="대 조 검 사"); dc.font=tf; dc.alignment=ct
+        for r in range(5,8):
+            for c in range(2,8): ws.cell(row=r,column=c).border=border
+        ws.row_dimensions[5].height=22; ws.row_dimensions[6].height=22
+        ws.row_dimensions[7].height=22; ws.row_dimensions[8].height=6; d=4
+    R=lambda n: n+d
+
+    ws.merge_cells(f'B{R(5)}:C{R(5)}'); ws.merge_cells(f'D{R(5)}:E{R(5)}')
+    for col in range(2,8):
+        c=ws.cell(row=R(5),column=col); c.font=hf; c.fill=hfill; c.alignment=ct; c.border=border
+    cs(R(5),2,"검사항목",hf,hfill); cs(R(5),4,"대조사항",hf,hfill)
+    cs(R(5),6,"검사결과",hf,hfill); cs(R(5),7,"비고",hf,hfill)
+
+    for row,item,ri in [(R(6),"시설자",0),(R(7),"허가번호",1),(R(8),"무선국명",2)]:
+        ws.merge_cells(f'B{row}:C{row}'); ws.merge_cells(f'D{row}:E{row}')
+        cs(row,2,item,bf,ifill); cs(row,4,sv(ri),nf); br(row,row,2,7); fr(row,row,2,3,ifill)
+
+    ws.merge_cells(f'B{R(9)}:B{R(10)}'); cs(R(9),2,"설치장소",bf,ifill2); fr(R(9),R(10),2,2,ifill2)
+    ws.merge_cells(f'D{R(9)}:E{R(9)}'); cs(R(9),3,"연주소",bf)
+    cs(R(9),4,sv(3),nf,align=la); br(R(9),R(9),2,7)
+    ws.merge_cells(f'D{R(10)}:E{R(10)}'); cs(R(10),3,"송신소",bf)
+    cs(R(10),4,sv(4),nf,align=la); br(R(10),R(10),2,7)
+
+    ws.merge_cells(f'B{R(11)}:B{R(22)}')
+    cs(R(11),2,"송신기",XlFont(name='Arial',bold=True,size=11),ifill3)
+    fr(R(11),R(22),2,2,ifill3); br(R(11),R(22),2,7)
+    for row,sub,ri in [(R(11),"장치구분",5),(R(12),"제조자명",6),(R(13),"형식 명칭",7),
+        (R(14),"일련번호",8),(R(15),"발진방식",9),(R(16),"변조방식",10),
+        (R(17),"체배방식",11),(R(18),"종단 명칭",12),(R(19),"종단 개수",13)]:
+        v1,v2=pv(ri); cs(row,3,sub,bf); cs(row,4,v1,nf); cs(row,5,v2,nf)
+    for row,sub,ri in [(R(20),"전력저하장치",14),(R(21),"안전시설",15),(R(22),"보호장치",16)]:
+        ws.merge_cells(f'D{row}:E{row}'); cs(row,3,sub,bf); cs(row,4,sv(ri),nf)
+
+    ws.merge_cells(f'B{R(23)}:B{R(25)}')
+    cs(R(23),2,"공중선",XlFont(name='Arial',bold=True,size=11),ifill4)
+    fr(R(23),R(25),2,2,ifill4); br(R(23),R(25),2,7)
+    for row,sub,ri in [(R(23),"형식",17),(R(24),"구성",18),(R(25),"지향성",19)]:
+        ws.merge_cells(f'D{row}:E{row}'); cs(row,3,sub,bf); cs(row,4,sv(ri),nf)
+
+    ws.merge_cells(f'B{R(26)}:B{R(27)}')
+    cs(R(26),2,"접지방식",XlFont(name='Arial',bold=True,size=11),ifill5)
+    fr(R(26),R(27),2,2,ifill5); br(R(26),R(27),2,7)
+    for row,sub,ri in [(R(26),"기기",20),(R(27),"공중선",21)]:
+        ws.merge_cells(f'D{row}:E{row}'); cs(row,3,sub,bf); cs(row,4,sv(ri),nf)
+
+    ws.merge_cells(f'B{R(28)}:C{R(28)}'); ws.merge_cells(f'D{R(28)}:E{R(28)}')
+    cs(R(28),2,"전원설비",bf,ifill); cs(R(28),4,sv(22),nf)
+    br(R(28),R(28),2,7); fr(R(28),R(28),2,3,ifill)
+
+    ws.row_dimensions[R(5)].height=22
+    for r in range(R(6),R(29)): ws.row_dimensions[r].height=20
+    for r in range(R(5),R(29)):
+        c=ws.cell(row=r,column=2); c.border=Border(top=c.border.top,left=medium,right=c.border.right,bottom=c.border.bottom)
+        c=ws.cell(row=r,column=7); c.border=Border(top=c.border.top,left=c.border.left,right=medium,bottom=c.border.bottom)
+    for col in range(2,8):
+        c=ws.cell(row=R(5),column=col); c.border=Border(top=medium,left=c.border.left,right=c.border.right,bottom=c.border.bottom)
+        c=ws.cell(row=R(28),column=col); c.border=Border(top=c.border.top,left=c.border.left,right=c.border.right,bottom=medium)
+    ws.cell(row=R(5),column=2).border=Border(top=medium,left=medium,right=thin,bottom=thin)
+    ws.cell(row=R(5),column=7).border=Border(top=medium,left=thin,right=medium,bottom=thin)
+    ws.cell(row=R(28),column=2).border=Border(top=thin,left=medium,right=thin,bottom=medium)
+    ws.cell(row=R(28),column=7).border=Border(top=thin,left=thin,right=medium,bottom=medium)
+    ws.print_area=f'A1:H{R(30)}'
+
+# ==========================================
+# [5] 보고서 생성
+# ==========================================
+def generate_report(config, output_path, report_title='', log_func=print):
+    txa_excel=config.get('txa_excel','')
+    txb_excel=config.get('txb_excel','')
+    comp_xlsx=config.get('comp_xlsx','')
+
+    txa_name=os.path.splitext(os.path.basename(txa_excel))[0][:31] if txa_excel else "TXA"
+    txb_name=os.path.splitext(os.path.basename(txb_excel))[0][:31] if txb_excel else "TXB"
+
+    wb=Workbook()
+
+    # TXA
+    if txa_excel and os.path.exists(txa_excel):
+        log_func(f"[{txa_name}] 원본 복사 + 수검 표 삽입 중...")
+        try:
+            src_wb=load_workbook(txa_excel)
+            ws_a=wb.create_sheet(title=txa_name)
+            copy_full_sheet(src_wb.active, ws_a)
+            insert_blank_rows_pages234(ws_a)
+            insert_inspection_page(ws_a, 'TX-A',
+                {'power':config.get('txa_power',''),'bw':config.get('txa_bw_val',''),'freq':config.get('txa_freq_val','')},
+                {'bw':config.get('txa_bw_img',''),'freq':config.get('txa_freq_img','')}, log_func)
+            log_func(f"  ✅ [{txa_name}] 완료")
+        except Exception as e:
+            log_func(f"  ⚠️ 실패: {e}"); traceback.print_exc()
+
+    # TXB
+    if txb_excel and os.path.exists(txb_excel):
+        log_func(f"[{txb_name}] 원본 복사 + 수검 표 삽입 중...")
+        try:
+            src_wb=load_workbook(txb_excel)
+            ws_b=wb.create_sheet(title=txb_name)
+            copy_full_sheet(src_wb.active, ws_b)
+            insert_blank_rows_pages234(ws_b)
+            insert_inspection_page(ws_b, 'TX-B',
+                {'power':config.get('txb_power',''),'bw':config.get('txb_bw_val',''),'freq':config.get('txb_freq_val','')},
+                {'bw':config.get('txb_bw_img',''),'freq':config.get('txb_freq_img','')}, log_func)
+            log_func(f"  ✅ [{txb_name}] 완료")
+        except Exception as e:
+            log_func(f"  ⚠️ 실패: {e}"); traceback.print_exc()
+
+    # 대조검사
+    log_func("대조검사 탭 생성 중...")
+    ws_comp=wb.create_sheet(title='대조검사')
+    comp_data=None
+    if comp_xlsx and os.path.exists(comp_xlsx):
+        log_func(f"  대조검사 엑셀 읽기: {os.path.basename(comp_xlsx)}")
+        comp_data=read_comparison_excel(comp_xlsx, log_func)
+    else:
+        log_func("  대조검사 엑셀 없음 → 빈 표 생성")
+    build_comparison_tab(ws_comp, comp_data, report_title)
+    log_func("  ✅ 대조검사 표 완료")
+
+    wb.move_sheet('대조검사',offset=-(len(wb.sheetnames)-1))
+    if 'Sheet' in wb.sheetnames: del wb['Sheet']
+    wb.save(output_path); log_func(f"\n✅ 저장 완료: {output_path}"); return output_path
+
+# ==========================================
+# [6] Windows GUI
+# ==========================================
+class App:
+    def __init__(self,root):
+        self.root=root; self.root.title("DTV 무선국 수검자료 생성기")
+        self.root.geometry("700x820"); self.root.resizable(True,True)
+        self.vars={
+            'txa_excel':StringVar(),'txa_power':StringVar(),'txa_bw_val':StringVar(),
+            'txa_freq_val':StringVar(),'txa_bw_img':StringVar(),'txa_freq_img':StringVar(),
+            'txb_excel':StringVar(),'txb_power':StringVar(),'txb_bw_val':StringVar(),
+            'txb_freq_val':StringVar(),'txb_bw_img':StringVar(),'txb_freq_img':StringVar(),
+            'comp_xlsx':StringVar(),'report_title':StringVar(),
+            'output_name':StringVar(value="무선국_수검자료_최종통합본.xlsx"),
+        }
+        self.build_gui()
+
+    def build_gui(self):
+        main=Frame(self.root,padx=15,pady=10); main.pack(fill=BOTH,expand=True)
+        Label(main,text="DTV 무선국 수검자료 생성기",font=("맑은 고딕",18,"bold"),fg="#203764").pack(pady=(0,2))
+        Label(main,text="원본 엑셀 + 수검 측정결과/이미지 + 대조검사",font=("맑은 고딕",9),fg="#888").pack()
+        ttk.Separator(main,orient='horizontal').pack(fill=X,pady=8)
+
+        # TX-A
+        self.add_section(main,"TX-A",[
+            ("원본 엑셀 (.xlsx)",'txa_excel','엑셀'),
+            ("점유주파수대역폭 이미지",'txa_bw_img','이미지'),
+            ("주파수정확도 이미지",'txa_freq_img','이미지'),
+        ])
+        tf=Frame(main); tf.pack(fill=X,padx=(30,0),pady=2)
+        Label(tf,text="공중선전력:",font=("맑은 고딕",8)).grid(row=0,column=0,sticky=W)
+        Entry(tf,textvariable=self.vars['txa_power'],font=("맑은 고딕",8),width=15).grid(row=0,column=1,padx=3)
+        Label(tf,text="점유주파수:",font=("맑은 고딕",8)).grid(row=0,column=2,sticky=W)
+        Entry(tf,textvariable=self.vars['txa_bw_val'],font=("맑은 고딕",8),width=15).grid(row=0,column=3,padx=3)
+        Label(tf,text="주파수정확도:",font=("맑은 고딕",8)).grid(row=0,column=4,sticky=W)
+        Entry(tf,textvariable=self.vars['txa_freq_val'],font=("맑은 고딕",8),width=15).grid(row=0,column=5,padx=3)
+
+        # TX-B
+        self.add_section(main,"TX-B",[
+            ("원본 엑셀 (.xlsx)",'txb_excel','엑셀'),
+            ("점유주파수대역폭 이미지",'txb_bw_img','이미지'),
+            ("주파수정확도 이미지",'txb_freq_img','이미지'),
+        ])
+        tf2=Frame(main); tf2.pack(fill=X,padx=(30,0),pady=2)
+        Label(tf2,text="공중선전력:",font=("맑은 고딕",8)).grid(row=0,column=0,sticky=W)
+        Entry(tf2,textvariable=self.vars['txb_power'],font=("맑은 고딕",8),width=15).grid(row=0,column=1,padx=3)
+        Label(tf2,text="점유주파수:",font=("맑은 고딕",8)).grid(row=0,column=2,sticky=W)
+        Entry(tf2,textvariable=self.vars['txb_bw_val'],font=("맑은 고딕",8),width=15).grid(row=0,column=3,padx=3)
+        Label(tf2,text="주파수정확도:",font=("맑은 고딕",8)).grid(row=0,column=4,sticky=W)
+        Entry(tf2,textvariable=self.vars['txb_freq_val'],font=("맑은 고딕",8),width=15).grid(row=0,column=5,padx=3)
+
+        # 대조검사
+        self.add_section(main,"대조검사",[("대조검사 엑셀 (.xlsx)",'comp_xlsx','엑셀')])
+
+        ttk.Separator(main,orient='horizontal').pack(fill=X,pady=6)
+        sf=Frame(main); sf.pack(fill=X,pady=2)
+        Label(sf,text="보고서 제목:",font=("맑은 고딕",9)).grid(row=0,column=0,sticky=W,pady=2)
+        Entry(sf,textvariable=self.vars['report_title'],font=("맑은 고딕",10),width=55).grid(row=0,column=1,sticky=W,padx=5,pady=2)
+        Label(sf,text="출력 파일명:",font=("맑은 고딕",9)).grid(row=1,column=0,sticky=W,pady=2)
+        Entry(sf,textvariable=self.vars['output_name'],font=("맑은 고딕",10),width=55).grid(row=1,column=1,sticky=W,padx=5,pady=2)
+
+        self.gen_btn=Button(main,text="보고서 생성",font=("맑은 고딕",13,"bold"),bg="#28a745",fg="white",height=2,command=self.on_generate)
+        self.gen_btn.pack(fill=X,pady=8)
+        lf=Frame(main); lf.pack(fill=BOTH,expand=True)
+        self.log_text=Text(lf,height=8,font=("Consolas",9),wrap=WORD,state='disabled')
+        sb=Scrollbar(lf,command=self.log_text.yview); self.log_text.configure(yscrollcommand=sb.set)
+        sb.pack(side=RIGHT,fill=Y); self.log_text.pack(fill=BOTH,expand=True)
+
+    def add_section(self,parent,title,fields):
+        Label(parent,text=title,font=("맑은 고딕",11,"bold"),fg="#203764").pack(anchor=W,pady=(8,2))
+        for label,vk,ft in fields:
+            row=Frame(parent); row.pack(fill=X,pady=1,padx=(15,0))
+            Label(row,text=label+":",font=("맑은 고딕",9),width=22,anchor=W).pack(side=LEFT)
+            Entry(row,textvariable=self.vars[vk],font=("맑은 고딕",8),width=38).pack(side=LEFT,padx=3)
+            Button(row,text="찾아보기",font=("맑은 고딕",8),command=lambda k=vk,t=ft:self.browse_file(k,t)).pack(side=LEFT)
+
+    def browse_file(self,vk,ft):
+        t=[("Excel","*.xlsx"),("All","*.*")] if ft=='엑셀' else [("Image","*.png *.jpg *.jpeg *.bmp"),("All","*.*")]
+        p=filedialog.askopenfilename(filetypes=t)
+        if p: self.vars[vk].set(p)
+
+    def log(self,msg):
+        self.log_text.configure(state='normal'); self.log_text.insert(END,msg+"\n")
+        self.log_text.see(END); self.log_text.configure(state='disabled'); self.root.update_idletasks()
+
+    def on_generate(self):
+        self.log_text.configure(state='normal'); self.log_text.delete('1.0',END); self.log_text.configure(state='disabled')
+        config={k:self.vars[k].get() for k in self.vars if k not in ('report_title','output_name')}
+        if not(config['txa_excel'] or config['txb_excel']):
+            messagebox.showwarning("알림","TXA 또는 TXB 원본 엑셀 파일을 최소 1개 선택해 주세요!"); return
+        op=filedialog.asksaveasfilename(defaultextension=".xlsx",initialfile=self.vars['output_name'].get(),
+            filetypes=[("Excel","*.xlsx")],title="보고서 저장 위치 선택")
+        if not op: return
+        rt=self.vars['report_title'].get().strip()
+        self.gen_btn.configure(state='disabled',text="⏳ 생성 중...")
+        self.log("="*45); self.log("  보고서 생성 시작"); self.log("="*45)
+        def run():
+            try:
+                generate_report(config,op,rt,log_func=self.log)
+                self.root.after(0,lambda:messagebox.showinfo("완료",f"보고서가 생성되었습니다!\n\n{op}"))
+                self.root.after(0,lambda:os.startfile(os.path.dirname(op)))
+            except PermissionError:
+                self.log(f"\n❌ 엑셀에서 파일이 열려 있습니다! 닫고 다시 시도하세요.")
+                self.root.after(0,lambda:messagebox.showerror("파일 사용 중",
+                    "엑셀에서 파일이 열려 있어 저장할 수 없습니다.\n엑셀에서 파일을 닫은 후 다시 시도해 주세요."))
+            except Exception as e:
+                self.log(f"\n❌ 오류: {e}"); traceback.print_exc()
+                self.root.after(0,lambda:messagebox.showerror("오류",f"보고서 생성 실패:\n{e}"))
+            finally:
+                self.root.after(0,lambda:self.gen_btn.configure(state='normal',text="보고서 생성"))
+        threading.Thread(target=run,daemon=True).start()
+
+if __name__=="__main__":
+    root=Tk(); app=App(root); root.mainloop()
